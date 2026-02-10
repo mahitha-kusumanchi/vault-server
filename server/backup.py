@@ -105,9 +105,29 @@ def restore_backup(backup_path):
 def list_backups():
     if not BACKUP_DIR.exists():
         return []
-    # Return list of .enc files sorted by newest first
-    backups = [f.name for f in BACKUP_DIR.iterdir() if f.is_file() and f.suffix == '.enc']
-    backups.sort(reverse=True)
+        
+    backups = []
+    for f in BACKUP_DIR.iterdir():
+        if f.is_file() and f.suffix == '.enc':
+            # Parse timestamp from filename: backup_YYYYMMDD_HHMMSS.enc
+            timestamp = None
+            try:
+                # Extract YYYYMMDD_HHMMSS
+                ts_str = f.stem.replace("backup_", "")
+                dt = datetime.datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                timestamp = dt.isoformat()
+            except ValueError:
+                # If filename doesn't match format, leave timestamp as None or use file mtime
+                timestamp = datetime.datetime.fromtimestamp(f.stat().st_mtime).isoformat()
+                
+            backups.append({
+                "filename": f.name,
+                "timestamp": timestamp,
+                "size": f.stat().st_size
+            })
+            
+    # Sort by filename desc (which happens to include timestamp)
+    backups.sort(key=lambda x: x["filename"], reverse=True)
     return backups
 
 def get_backup_path(filename):
