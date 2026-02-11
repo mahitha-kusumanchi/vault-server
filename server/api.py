@@ -14,6 +14,7 @@ from server.auth import (
 )
 from server.storage import store_blob, load_blob
 from server.backup import create_backup, restore_backup, list_backups, get_backup_path
+from server.audit import log_action, get_logs
 
 app = FastAPI()
 
@@ -53,7 +54,6 @@ def auth_salt(username: str):
 def register(req: RegisterReq, request: Request):
     client_ip = request.client.host
     try:
-        security_manager.check_rate_limit(client_ip)
         register_user(req.username.lower(), req.salt, req.verifier)
         return {"ok": True}
     except ValueError as e:
@@ -65,16 +65,10 @@ def register(req: RegisterReq, request: Request):
 def login(req: LoginReq, request: Request):
     client_ip = request.client.host
     try:
-        security_manager.check_rate_limit(client_ip)
         token = login_user(req.username.lower(), req.verifier)
-        security_manager.reset_attempts(client_ip)
         return {"token": token}
-    except ValueError as e:
-        if "IP blocked" in str(e):
-             raise HTTPException(429, str(e))
-        if "Invalid credentials" in str(e):
-            security_manager.record_failed_attempt(client_ip, req.username)
-        raise HTTPException(401, str(e))
+    except ValueError:
+        raise HTTPException(401, "Invalid credentials")
 
 @app.get("/vault")
 def get_vault(authorization: str = Header()):
@@ -82,6 +76,8 @@ def get_vault(authorization: str = Header()):
         user = require_auth(authorization)
     except ValueError:
         raise HTTPException(401, "Unauthorized")
+    
+    log_action(user, "VAULT_ACCESS", "Vault retrieved")
     return {"blob": load_blob(user)}
 
 @app.post("/vault")
@@ -91,6 +87,7 @@ def put_vault(req: VaultReq, authorization: str = Header()):
     except ValueError:
         raise HTTPException(401, "Unauthorized")
     store_blob(user, req.blob)
+    log_action(user, "VAULT_UPDATE", "Vault updated")
     return {"ok": True}
 
 @app.post("/mfa/setup")
@@ -103,6 +100,7 @@ def mfa_setup(authorization: str = Header()):
     
     try:
         mfa_data = setup_mfa(user)
+        log_action(user, "MFA_SETUP_INIT", "MFA setup initiated")
         return mfa_data
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -112,13 +110,10 @@ def mfa_verify(req: MFAVerifyReq, request: Request):
     """Verify MFA code and enable MFA for user"""
     client_ip = request.client.host
     try:
-        security_manager.check_rate_limit(client_ip)
         is_valid = verify_mfa(req.username.lower(), req.code.strip())
         if is_valid:
-            security_manager.reset_attempts(client_ip)
             return {"ok": True, "message": "MFA enabled successfully"}
         else:
-            security_manager.record_failed_attempt(client_ip, req.username)
             raise HTTPException(400, "Invalid MFA code")
     except ValueError as e:
         if "IP blocked" in str(e):
@@ -149,10 +144,8 @@ def login_with_mfa(req: MFALoginReq, request: Request):
         # Then verify MFA code
         is_valid = verify_mfa(username, req.mfa_code.strip(), enable_on_success=False)
         if not is_valid:
-            security_manager.record_failed_attempt(client_ip, username)
             raise HTTPException(401, "Invalid MFA code")
         
-        security_manager.reset_attempts(client_ip)
         return {"token": token}
     except ValueError as e:
         if "MFA not set up" in str(e):
@@ -178,6 +171,7 @@ def mfa_disable(authorization: str = Header()):
     
     try:
         disable_mfa(user)
+        log_action(user, "MFA_DISABLED", "MFA disabled")
         return {"ok": True, "message": "MFA disabled successfully"}
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -185,31 +179,44 @@ def mfa_disable(authorization: str = Header()):
 @app.get("/backups")
 def get_backups(authorization: str = Header()):
     try:
-        require_auth(authorization)
+        user = require_auth(authorization)
     except ValueError:
         raise HTTPException(401, "Unauthorized")
+    log_action(user, "BACKUP_LIST", "Listed backups")
     return {"backups": list_backups()}
 
 @app.post("/backups")
 def create_new_backup(authorization: str = Header()):
     try:
-        require_auth(authorization)
+        user = require_auth(authorization)
     except ValueError:
         raise HTTPException(401, "Unauthorized")
     path = create_backup()
-    return {"filename": Path(path).name}
+    filename = Path(path).name
+    log_action(user, "BACKUP_CREATE", f"Created backup: {filename}")
+    return {"filename": filename}
 
 @app.post("/backups/restore")
 def restore_backup_endpoint(req: RestoreReq, authorization: str = Header()):
     try:
-        require_auth(authorization)
+        user = require_auth(authorization)
     except ValueError:
         raise HTTPException(401, "Unauthorized")
     
     try:
         path = get_backup_path(req.filename)
         restore_backup(path)
+        log_action(user, "BACKUP_RESTORE", f"Restored backup: {req.filename}")
     except ValueError as e:
         raise HTTPException(400, str(e))
     
     return {"ok": True}
+
+@app.get("/logs")
+def get_audit_logs(authorization: str = Header()):
+    try:
+        user = require_auth(authorization)
+    except ValueError:
+        raise HTTPException(401, "Unauthorized")
+    
+    return {"logs": get_logs(user)}
